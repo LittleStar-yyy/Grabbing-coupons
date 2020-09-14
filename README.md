@@ -18,8 +18,6 @@ docker-compose 1.25.0
 
  ![1578462368446](README.assets/1578462368446.png)
 
-本项目用到的技术原理总结在[高并发秒杀项目总结笔记（Golang, Redis, lua）](https://blog.csdn.net/weixin_41519463/article/details/103892737)
-
 # 开始
 
 首先安装上述环境，还有IDE：goland，安装方法参考
