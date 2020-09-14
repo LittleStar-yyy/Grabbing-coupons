@@ -279,7 +279,7 @@ api.RunSecKillConsumer()
 go seckillConsumer()
 ```
 
-这里主要是用到了go的CSP并发模型，参考[Go的CSP并发模型（goroutine + channel）](https://blog.csdn.net/weixin_41519463/article/details/103848698)，简单来说，主goroutine扮演生产者角色，处理用户抢购请求，每当一个用户抢购成功后，就更新redis中的数据。此时为了将数据更新持久化到数据库中（保持redis与数据库的数据一致性），就需要接着更新数据库，但是如果在主goroutine中更新数据库，则主goroutine不得不等待缓慢的数据库访问。为了避免这种情况，就需要新开一个消费者goroutine，然后通过有缓存的channel来进行二者之间的通信。总的来说，就是生产者每次更新完redis后，将这个消息送到channel中，接着马上去处理下一个用户抢购请求。由于主goroutine不需要等待数据库更新，所以可以发挥redis高速读写的特性，更好的支持高并发请求。消费者goroutine这边则是一直监听channel，发现有消息后拿到消息，然后更新数据库。也就是说主goroutine与消费者goroutine并行执行，redis与数据库的更新是异步执行、互不干扰的。
+这里主要是用到了go的CSP并发模型，简单来说，主goroutine扮演生产者角色，处理用户抢购请求，每当一个用户抢购成功后，就更新redis中的数据。此时为了将数据更新持久化到数据库中（保持redis与数据库的数据一致性），就需要接着更新数据库，但是如果在主goroutine中更新数据库，则主goroutine不得不等待缓慢的数据库访问。为了避免这种情况，就需要新开一个消费者goroutine，然后通过有缓存的channel来进行二者之间的通信。总的来说，就是生产者每次更新完redis后，将这个消息送到channel中，接着马上去处理下一个用户抢购请求。由于主goroutine不需要等待数据库更新，所以可以发挥redis高速读写的特性，更好的支持高并发请求。消费者goroutine这边则是一直监听channel，发现有消息后拿到消息，然后更新数据库。也就是说主goroutine与消费者goroutine并行执行，redis与数据库的更新是异步执行、互不干扰的。
 
 函数seckillConsumer()中描述了消费者goroutine如何从channel中读取信息，更新数据库（就是当redis中优惠券数量减一时，就让数据库也减一）。
 
@@ -299,6 +299,59 @@ type secKillMessage struct {
 }
 ```
 
+Go的CSP并发模型（goroutine + channel）
+
+背景：Go从语言层面支持并发，解决并发的难点在于协程之间的协作。Go提供了两种方案：
+
+1. 支持协程之间以共享内存的方式通信，Go提供了管程和原子类进行同步控制，该方案与Java类似
+
+2. 支持协程之间以消息传递的方式通信，本质上是要避免共享，该方案是基于CSP模型实现的
+
+CSP并发模型用于描述两个独立的并发实体通过共享的通讯channel（管道）进行通信的并发模型。CSP中channel是第一类对象，它不关注发送消息的实体，而关注发送消息时使用的channel。
+
+1. Go实现的CSP模式可以类比成  生产者-消费者模式，channel 类比成 生产者-消费者模式中的阻塞队列
+
+2. Go中的channel容量可以为0，容量为0的channel被称为无缓冲的channel，容量大于0的channel被称为有缓冲的channel
+
+3. 无缓冲的channel主要是在两个协程之间做数据交换
+
+4. Go中的channel是语言层面支持的，使用左向箭头 <- 完成向channel发送数据和读取数据的任务
+
+5. Go中的channel是双向传输的，即一个协程既可以通过它发送数据，也可以通过它接收数据
+
+6. Go中的双向channel可以变成一个单向channel
+
+goroutine+channel机制：GPM模型  https://www.cnblogs.com/Delo/articles/12553653.html
+
+Go程序可以同时并发成千上万个goroutine是得益于它强劲地调度器和高效的内存模型：相较于每个os线程固定分配2M内存的模式，goroutine的栈采取了动态扩容方式，初始仅为2KB，随着任务执行按需增长，最大可达1GB，且完全由golang自己的调度器调度；还会周期性地将不再使用地内存回收，收缩栈空间。
+
+在Go语言中，每个goroutine是一个独立的执行单元，但是Go不直接将goroutine与内核线程绑定起来运行，而是通过一个上下文P来作为调度的中介，P提供了goroutine运行所需的一切资源和环境，所以在goroutine看来P就是运行它的 “CPU”。
+
+一个内核线程M绑定一个P，一个P维持一个本地goroutine队列，同一时刻里，一个上下文中只有一个goroutine运行。当通过go关键字创建一个新的goroutine的时候，它会优先被放入P的本地队列。然后M从P的本地队列里取出一个goroutine并执行。它还有一个 work-stealing调度算法：当M执行完了当前P的本地队列里的所有goroutine后，P会先尝试从全局队列寻找G来执行（一次性转移（全局G个数/P个数）），如果全局队列也为空，它就会随机挑选另外一个P，从它的队列里中偷走一半的goroutine到自己的队列中执行。
+
+当M上执行的G阻塞时，P与M分离，这个阻塞的G仍然和M绑在一起继续阻塞等待系统调用返回。那么P就可以继续和其他的M结合，然后继续运行队列里的其他G。阻塞结束后，M需要去找一个P，然后尝试把这个G加入P的本地队列运行，或者加入全局队列。
+
+当M0返回时，它必须尝试取得一个context P来运行goroutine，一般情况下，它会从其他的线程那里steal偷一个context过来，如果没有偷到的话，它就把goroutine放在一个global runqueue里，然后自己就去睡大觉了（放入线程缓存里）。Contexts们也会周期性的检查global runqueue，否则global runqueue上的goroutine永远无法执行。
+
+如果一个G任务执行时间太长，它就会一直占用 M 线程，由于队列的G任务是顺序执行的，其它G任务就会阻塞，如何避免该情况发生？
+
+协程的切换时间片是10ms，也就是说 goroutine 最多执行10ms就会被 M 切换到下一个 G。这个过程，又被称为 中断，挂起。
+
+go程序启动时，会首先创建一个特殊的内核线程sysmon，用来监控和管理，其内部是一个循环：
+
+1. 记录所有P的G任务的 计数 schedtick，schedtick会在每执行一个G任务后递增；
+
+2. 如果检查到 schedtick 一直没有递增，说明这个P 一直在执行同一个G任务，如果超过10ms，就在这个G任务的栈信息里加一个tag标记；
+
+3. 然后这个G任务在执行时，如果遇到非内联函数的调用，就会检查一次这个标记，然后中断自己，把自己加到队列末尾，执行下一个G；
+
+4. 如果没有遇到非内联函数调用（有时候正常小函数会被优化成内联函数），那就会一直执行这个G任务，直到它自己结束；如果是个死循环，并且 GOMAXPROCS=1 的话。那么一直只会只有一个 P 与一个 M，且队列中的其他 G 不会被执行！
+
+中断后的恢复：
+
+中断的时候将寄存器里的栈信息，保存到自己的 G 对象里面
+
+当再次轮到自己执行时，将自己保存的栈信息复制到寄存器里面，这样就接着上次之后运行
 
 
 ### 4、middleware/jwt/jwt.go
